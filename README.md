@@ -5,8 +5,8 @@ Manage cross-compilation toolchains from github.com/haarer/toolchain68k
 ## Features
 
 - List installed toolchains in `/opt`
-- Browse available toolchains from GitHub releases
-- Download and install toolchains
+- Browse available toolchains from GitHub releases (including release tags)
+- Download and install toolchains (optionally pinning to a specific release tag)
 - Remove installed toolchains
 - Interactive menu or command-line usage
 
@@ -63,13 +63,16 @@ tcman
 # List installed toolchains
 tcman list
 
-# List available from GitHub
+# List available from GitHub (shows release tags)
 tcman available
 
 # Install a toolchain (requires root)
 sudo tcman install m68k-elf
 sudo tcman install arm-none-eabi
 sudo tcman install avr
+
+# Install a specific release tag (requires root)
+sudo tcman install m68k-elf gcc152-update1
 
 # Remove a toolchain (requires root)
 sudo tcman remove m68k-elf

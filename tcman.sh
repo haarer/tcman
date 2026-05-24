@@ -65,6 +65,18 @@ extract_target_from_name() {
     fi
 }
 
+version_compare() {
+    local v1="$1" v2="$2"
+    local IFS=.
+    local a=($v1) b=($v2)
+    for ((i=0; i<${#a[@]} || i<${#b[@]}; i++)); do
+        local av="${a[$i]:-0}" bv="${b[$i]:-0}"
+        if ((av > bv)); then echo 1; return; fi
+        if ((av < bv)); then echo -1; return; fi
+    done
+    echo 0
+}
+
 get_installed_toolchains() {
     for dir in "$TOOLCHAIN_DIR"/toolchain-*; do
         [ -e "$dir" ] || continue
@@ -78,27 +90,29 @@ get_installed_toolchains() {
         local name=$(json_get "$dir/package.json" "name")
         local version=$(json_get "$dir/package.json" "version")
         local target=$(extract_target_from_name "$name")
+        local tag=$(json_get "$dir/package.json" "tag")
 
         if [ -n "$target" ] && [ -n "$version" ]; then
-            echo "$target:$version:$dir:$name"
+            echo "$target:$version:$dir:$name:$tag"
         fi
     done
 }
 
 list_installed() {
     info "Installed toolchains in $TOOLCHAIN_DIR:"
-    echo "===================================================================================="
-    printf "%-20s | %-15s | %s\n" "TARGET" "VERSION" "DIRECTORY"
-    echo "------------------------------------------------------------------------------------"
+    echo "================================================================================================"
+    printf "%-20s | %-15s | %-20s | %s\n" "TARGET" "VERSION" "TAG" "DIRECTORY"
+    echo "------------------------------------------------------------------------------------------------"
 
     local count=0
-    while IFS=: read -r target version dir name; do
+    while IFS=: read -r target version dir name tag; do
         [ -z "$target" ] && continue
-        printf "%-20s | %-15s | %s\n" "$target" "$version" "$name"
+        [ -z "$tag" ] && tag="-"
+        printf "%-20s | %-15s | %-20s | %s\n" "$target" "$version" "$tag" "$name"
         ((count++))
     done < <(get_installed_toolchains)
 
-    echo "===================================================================================="
+    echo "================================================================================================"
     if [ $count -eq 0 ]; then
         warn "No toolchains installed"
     fi
@@ -148,16 +162,7 @@ list_available() {
 
     local releases=$(fetch_releases)
     local platform=$(detect_platform)
-
-    echo "===================================================================================="
-    echo "Platform: $platform"
-    echo "===================================================================================="
-    printf "%-20s | %-15s | %s\n" "TARGET" "VERSION" "STATUS"
-    echo "------------------------------------------------------------------------------------"
-
-    local installed=$(get_installed_toolchains)
-    local found=0
-    local seen=""
+    local tmpfile=$(mktemp)
 
     for url in $(parse_download_urls "$releases"); do
         local fname=$(basename "$url")
@@ -168,39 +173,70 @@ list_available() {
 
         local target=$(echo "$match_result" | cut -d: -f1)
         local version=$(echo "$match_result" | cut -d: -f2)
+        local tag=$(echo "$url" | sed 's|.*/download/\([^/]*\)/.*|\1|')
 
-        echo "$seen" | grep -q "|$target|" && continue
-        seen="${seen}|$target|"
+        echo "$target|$version|$tag" >> "$tmpfile"
+    done
+
+    local installed=$(get_installed_toolchains)
+
+    echo "=================================================================================================="
+    echo "Platform: $platform"
+    echo "=================================================================================================="
+    printf "%-20s | %-15s | %-20s | %s\n" "TARGET" "VERSION" "TAG" "STATUS"
+    echo "--------------------------------------------------------------------------------------------------"
+
+    local found=0
+    while IFS='|' read -r target version tag; do
+        [ -z "$target" ] && continue
 
         local status="${YELLOW}available${NC}"
-        if echo "$installed" | grep -q "^$target:"; then
-            local installed_ver=$(echo "$installed" | grep "^$target:" | cut -d: -f2)
-            if [ "$installed_ver" = "$version" ]; then
+        local installed_ver=""
+        # Prefer exact (target, tag) match
+        local match_line=$(echo "$installed" | grep "^${target}:" | grep ":${tag}$" | head -1)
+        if [ -z "$match_line" ]; then
+            # Fallback: legacy entry with empty tag
+            match_line=$(echo "$installed" | grep "^${target}:" | grep ":$" | head -1)
+        fi
+        if [ -n "$match_line" ]; then
+            installed_ver=$(echo "$match_line" | cut -d: -f2)
+            local cmp=$(version_compare "$version" "$installed_ver")
+            if [ "$cmp" -eq 0 ]; then
                 status="${GREEN}installed${NC}"
-            else
+            elif [ "$cmp" -gt 0 ]; then
                 status="${YELLOW}upgradable ($installed_ver -> $version)${NC}"
+            else
+                status="${YELLOW}downgrade ($installed_ver -> $version)${NC}"
             fi
         fi
 
-        printf "%-20s | %-15s | %b\n" "$target" "$version" "$status"
+        printf "%-20s | %-15s | %-20s | %b\n" "$target" "$version" "$tag" "$status"
         found=1
-    done
+    done < <(awk '!seen[$0]++' "$tmpfile")
+
+    rm -f "$tmpfile"
 
     if [ $found -eq 0 ]; then
         warn "No toolchains found. Check network connection."
     fi
 
-    echo "===================================================================================="
+    echo "=================================================================================================="
 }
 
 get_download_info_for_target() {
     local json="$1"
     local target="$2"
+    local req_tag="${3:-}"
     local platform=$(detect_platform)
 
     for url in $(parse_download_urls "$json"); do
         local fname=$(basename "$url")
         [ "$fname" = "manifest.json" ] && continue
+
+        local tag=$(echo "$url" | sed 's|.*/download/\([^/]*\)/.*|\1|')
+        if [ -n "$req_tag" ] && [ "$tag" != "$req_tag" ]; then
+            continue
+        fi
 
         local match_result=$(match_asset_for_platform "$fname" "$platform")
         [ -z "$match_result" ] && continue
@@ -218,11 +254,16 @@ get_download_info_for_target() {
 
 download_and_install() {
     local target="$1"
+    local tag="${2:-}"
     local releases=$(fetch_releases)
 
-    local result=$(get_download_info_for_target "$releases" "$target")
+    local result=$(get_download_info_for_target "$releases" "$target" "$tag")
     if [ -z "$result" ]; then
-        error "Toolchain '$target' not found for your platform"
+        if [ -n "$tag" ]; then
+            error "Toolchain '$target' with tag '$tag' not found for your platform"
+        else
+            error "Toolchain '$target' not found for your platform"
+        fi
         info "Available targets: m68k-elf, arm-none-eabi, avr"
         return 1
     fi
@@ -230,11 +271,12 @@ download_and_install() {
     local version=$(echo "$result" | cut -d: -f1)
     local fname=$(echo "$result" | cut -d: -f2)
     local dl_url=$(echo "$result" | cut -d: -f3-)
+    local dl_tag=$(echo "$dl_url" | sed 's|.*/download/\([^/]*\)/.*|\1|')
 
     check_root
 
     local tmpdir=$(mktemp -d)
-    info "Downloading $fname..."
+    info "Downloading $fname (tag: $dl_tag)..."
     info "From: $dl_url"
 
     if ! http_download "$dl_url" "$tmpdir/$fname"; then
@@ -327,7 +369,7 @@ remove_toolchain() {
     local dir=""
     local name=""
 
-    while IFS=: read -r t v d n; do
+    while IFS=: read -r t v d n itag; do
         if [ "$t" = "$target" ]; then
             found=1
             version="$v"
@@ -378,7 +420,8 @@ show_menu() {
             echo
             echo "Targets: m68k-elf, arm-none-eabi, avr"
             read -p "Target to install: " target
-            [ -n "$target" ] && download_and_install "$target"
+            read -p "Release tag (optional, use 'available' to list): " tag
+            [ -n "$target" ] && download_and_install "$target" "$tag"
             ;;
         4)
             echo
@@ -398,8 +441,8 @@ main() {
             list|ls) list_installed ;;
             available|avail) list_available ;;
             install)
-                [ -z "$2" ] && { error "Usage: tcman install <target>"; exit 1; }
-                download_and_install "$2"
+                [ -z "$2" ] && { error "Usage: tcman install <target> [tag]"; exit 1; }
+                download_and_install "$2" "$3"
                 ;;
             remove|uninstall)
                 [ -z "$2" ] && { error "Usage: tcman remove <target>"; exit 1; }
@@ -411,7 +454,8 @@ main() {
                 echo "Commands:"
                 echo "  list, ls        List installed toolchains"
                 echo "  available       List available from GitHub"
-                echo "  install <tgt>   Install (m68k-elf, arm-none-eabi, avr)"
+                echo "  install <tgt>      Install (m68k-elf, arm-none-eabi, avr)"
+                echo "  install <tgt> <tag> Install specific release tag"
                 echo "  remove <tgt>    Remove installed toolchain"
                 echo "  help            Show this help"
                 echo
